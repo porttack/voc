@@ -67,22 +67,6 @@ sudo systemctl disable voc       # don't start on boot
 
 ---
 
-## Running scripts manually
-
-All scripts run inside the virtualenv. Either activate it first:
-
-```bash
-source .venv/bin/activate
-python3 read_voc.py
-deactivate
-```
-
-Or call the venv Python directly without activating:
-
-```bash
-.venv/bin/python3 read_voc.py
-```
-
 ## Command-line scripts
 
 These are useful for one-off readings or cron jobs and work independently
