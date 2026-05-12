@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SGP30 VOC web dashboard — live air quality monitor on port 8080."""
+"""SGP30 VOC web dashboard — live air quality monitor."""
 
 import collections
 import csv
@@ -9,153 +9,139 @@ import sys
 import threading
 import time
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request, send_file
 
-from sgp30 import SGP30
-
 # ── Config ────────────────────────────────────────────────────────────────────
-BASELINE_FILE = "baseline.json"
-BASELINE_MAX_AGE_DAYS = 7
-WARMUP_SECONDS = 15
-MAX_LIVE_HISTORY = 300      # 5 min at 1 Hz
-LOG_DIR = Path.home() / ".local" / "voc"
-LOG_FILE = LOG_DIR / "voc.csv"
-LOG_INTERVAL = 300          # seconds between CSV rows
-PORT = 8080
-TZ = ZoneInfo("America/Los_Angeles")
+@dataclass
+class _Cfg:
+    port:                  int  = 8080
+    ntfy_url:              str  = ""
+    ntfy_cooldown_minutes: int  = 30
+    gsheet_write:          bool = False
+    gsheet_id:             str  = ""
+    gsheet_worksheet:      str  = "Sheet1"
+    gsheet_credentials:    str  = ""
+    gsheet_read:           bool = False
 
-# ntfy defaults — overridden by config.json
-NTFY_URL: str = ""          # empty = disabled
-NTFY_COOLDOWN: float = 1800 # seconds
+    @property
+    def ntfy_cooldown(self) -> float:
+        return self.ntfy_cooldown_minutes * 60
 
 
-def _load_config() -> None:
-    global NTFY_URL, NTFY_COOLDOWN
-    cfg_path = Path("config.json")
-    if not cfg_path.exists():
-        return
-    try:
-        with open(cfg_path) as f:
-            cfg = json.load(f)
-        NTFY_URL = cfg.get("ntfy_url", NTFY_URL).strip()
-        NTFY_COOLDOWN = cfg.get("ntfy_cooldown_minutes", 30) * 60
-        if NTFY_URL:
-            print(f"ntfy alerts → {NTFY_URL}  (cooldown {NTFY_COOLDOWN/60:.0f} min)",
-                  flush=True)
-    except Exception as exc:
-        print(f"Config load error: {exc}", file=sys.stderr, flush=True)
+def _load_config() -> _Cfg:
+    """Load config.py, then overlay ~/.config/voc/config.py if present."""
+    cfg = _Cfg()
+    paths = [Path("config.py"), Path.home() / ".config" / "voc" / "config.py"]
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            ns: dict = {}
+            exec(compile(path.read_text(), str(path), "exec"), {}, ns)
+            for key, val in ns.items():
+                attr = key.lower()
+                if not key.startswith("_") and hasattr(cfg, attr):
+                    setattr(cfg, attr, val)
+            print(f"Config loaded: {path}", flush=True)
+        except Exception as exc:
+            print(f"Config error ({path}): {exc}", file=sys.stderr, flush=True)
+    return cfg
 
+
+cfg = _load_config()
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+BASELINE_FILE    = "baseline.json"
+BASELINE_MAX_AGE = 7           # days
+WARMUP_SECONDS   = 15
+MAX_LIVE_HISTORY = 300         # 5 min at 1 Hz
+LOG_DIR          = Path.home() / ".local" / "voc"
+LOG_FILE         = LOG_DIR / "voc.csv"
+LOG_INTERVAL     = 300         # seconds between CSV / Sheet rows
+TZ               = ZoneInfo("America/Los_Angeles")
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 app = Flask(__name__)
-_lock = threading.Lock()
+_lock    = threading.Lock()
 _history: collections.deque = collections.deque(maxlen=MAX_LIVE_HISTORY)
-_state: dict = {"eco2": None, "tvoc": None, "ts": None, "phase": "starting"}
+_state:   dict = {"eco2": None, "tvoc": None, "ts": None, "phase": "starting"}
 
-# ntfy alert state (accessed only from sensor thread — no lock needed)
 _ntfy_state = {"tvoc_lvl": 0, "eco2_lvl": 0, "last_sent": 0.0}
 
-
 # ── Baseline ──────────────────────────────────────────────────────────────────
-def _load_baseline(sensor: SGP30) -> None:
+def _load_baseline(sensor) -> None:
     if not os.path.exists(BASELINE_FILE):
         return
     try:
         with open(BASELINE_FILE) as f:
             data = json.load(f)
-        saved_at = datetime.fromisoformat(data["saved_at"])
-        age = (datetime.now(timezone.utc) - saved_at).total_seconds() / 86400
-        if age <= BASELINE_MAX_AGE_DAYS:
+        age = (datetime.now(timezone.utc) -
+               datetime.fromisoformat(data["saved_at"])).total_seconds() / 86400
+        if age <= BASELINE_MAX_AGE:
             sensor.set_baseline(data["eco2_baseline"], data["tvoc_baseline"])
-            print(f"Loaded baseline (age {age:.1f}d)", flush=True)
+            print(f"Baseline loaded (age {age:.1f}d)", flush=True)
     except Exception as exc:
         print(f"Baseline load error: {exc}", file=sys.stderr, flush=True)
 
 
-def _save_baseline(sensor: SGP30) -> None:
+def _save_baseline(sensor) -> None:
     try:
         eco2b, tvocb = sensor.get_baseline()
         if eco2b == 0 and tvocb == 0:
             return
-        payload = {"eco2_baseline": eco2b, "tvoc_baseline": tvocb,
-                   "saved_at": datetime.now(timezone.utc).isoformat()}
         with open(BASELINE_FILE, "w") as f:
-            json.dump(payload, f, indent=2)
-        print(f"Baseline saved: eCO2={eco2b}, TVOC={tvocb}", flush=True)
+            json.dump({"eco2_baseline": eco2b, "tvoc_baseline": tvocb,
+                       "saved_at": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+        print(f"Baseline saved: eCO2={eco2b} TVOC={tvocb}", flush=True)
     except Exception as exc:
         print(f"Baseline save error: {exc}", file=sys.stderr, flush=True)
 
-
-# ── ntfy alerts ───────────────────────────────────────────────────────────────
-def _tvoc_level(v: int) -> int:
-    if v >= 5500: return 3
-    if v >= 2200: return 2
-    if v >= 660:  return 1
-    return 0
-
-
-def _eco2_level(v: int) -> int:
-    if v >= 2000: return 3
-    if v >= 1500: return 2
-    if v >= 1000: return 1
-    return 0
-
-
+# ── ntfy ──────────────────────────────────────────────────────────────────────
 _LEVEL_LABELS = ["Good", "Moderate", "Poor", "Very Poor"]
 
+def _tvoc_level(v: int) -> int:
+    return 3 if v >= 5500 else 2 if v >= 2200 else 1 if v >= 660 else 0
+
+def _eco2_level(v: int) -> int:
+    return 3 if v >= 2000 else 2 if v >= 1500 else 1 if v >= 1000 else 0
 
 def _ntfy_post(title: str, body: str, priority: str, tags: str) -> None:
-    if not NTFY_URL:
+    if not cfg.ntfy_url:
         return
     try:
-        req = urllib.request.Request(
-            NTFY_URL,
-            data=body.encode(),
-            headers={"Title": title, "Priority": priority, "Tags": tags},
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=5)
-        print(f"ntfy sent: {title}", flush=True)
+        urllib.request.urlopen(
+            urllib.request.Request(cfg.ntfy_url, data=body.encode(),
+                headers={"Title": title, "Priority": priority, "Tags": tags},
+                method="POST"), timeout=5)
+        print(f"ntfy: {title}", flush=True)
     except Exception as exc:
         print(f"ntfy error: {exc}", file=sys.stderr, flush=True)
 
-
 def _check_alerts(eco2: int, tvoc: int) -> None:
-    tl = _tvoc_level(tvoc)
-    el = _eco2_level(eco2)
+    tl, el = _tvoc_level(tvoc), _eco2_level(eco2)
     now = time.monotonic()
-
-    # Alert when level worsens, or re-alert after cooldown while still Poor+
     worsened = tl > _ntfy_state["tvoc_lvl"] or el > _ntfy_state["eco2_lvl"]
-    cooldown_expired = (now - _ntfy_state["last_sent"]) >= NTFY_COOLDOWN
-    still_bad = tl >= 2 or el >= 2
-
-    if worsened or (still_bad and cooldown_expired):
+    cooldown_expired = (now - _ntfy_state["last_sent"]) >= cfg.ntfy_cooldown
+    if worsened or ((tl >= 2 or el >= 2) and cooldown_expired):
         msgs, worst = [], max(tl, el)
-        if tl >= 2:
-            msgs.append(f"TVOC {_LEVEL_LABELS[tl]}: {tvoc} ppb")
-        if el >= 2:
-            msgs.append(f"eCO₂ {_LEVEL_LABELS[el]}: {eco2} ppm")
+        if tl >= 2: msgs.append(f"TVOC {_LEVEL_LABELS[tl]}: {tvoc} ppb")
+        if el >= 2: msgs.append(f"eCO₂ {_LEVEL_LABELS[el]}: {eco2} ppm")
         if msgs:
-            priority = "urgent" if worst >= 3 else "high"
-            tags = "rotating_light" if worst >= 3 else "warning"
-            body = "\n".join(msgs) + "\n\nVentilate the space."
-            _ntfy_post("⚠️ VOC Alert — SLV Makerspace", body, priority, tags)
+            _ntfy_post("⚠️ VOC Alert — SLV Makerspace",
+                       "\n".join(msgs) + "\n\nVentilate the space.",
+                       "urgent" if worst >= 3 else "high",
+                       "rotating_light" if worst >= 3 else "warning")
             _ntfy_state["last_sent"] = now
-
-    # Always send an "all-clear" when dropping back below Poor
-    if (tl < 2 and el < 2) and (_ntfy_state["tvoc_lvl"] >= 2 or _ntfy_state["eco2_lvl"] >= 2):
+    if tl < 2 and el < 2 and (_ntfy_state["tvoc_lvl"] >= 2 or _ntfy_state["eco2_lvl"] >= 2):
         _ntfy_post("✅ Air Quality Cleared — SLV Makerspace",
                    f"TVOC {tvoc} ppb, eCO₂ {eco2} ppm — back to normal.",
                    "default", "white_check_mark")
-
-    _ntfy_state["tvoc_lvl"] = tl
-    _ntfy_state["eco2_lvl"] = el
-
+    _ntfy_state["tvoc_lvl"], _ntfy_state["eco2_lvl"] = tl, el
 
 # ── CSV logging ───────────────────────────────────────────────────────────────
 def _ensure_log() -> None:
@@ -164,35 +150,125 @@ def _ensure_log() -> None:
         with open(LOG_FILE, "w", newline="") as f:
             csv.writer(f).writerow(["timestamp", "eco2_ppm", "tvoc_ppb"])
 
-
-def _append_log(eco2: int, tvoc: int) -> None:
+def _append_csv(eco2: int, tvoc: int) -> None:
     ts = datetime.now(TZ).isoformat(timespec="seconds")
     with open(LOG_FILE, "a", newline="") as f:
         csv.writer(f).writerow([ts, eco2, tvoc])
 
+# ── Google Sheets ─────────────────────────────────────────────────────────────
+_gsheet_ws = None
 
-# ── Sensor loop ───────────────────────────────────────────────────────────────
+def _get_ws():
+    global _gsheet_ws
+    if _gsheet_ws is None:
+        try:
+            import gspread
+        except ImportError:
+            raise RuntimeError(
+                "gspread not installed — run: .venv/bin/pip install gspread google-auth")
+        gc = gspread.service_account(filename=cfg.gsheet_credentials)
+        _gsheet_ws = gc.open_by_key(cfg.gsheet_id).worksheet(cfg.gsheet_worksheet)
+    return _gsheet_ws
+
+def _gsheet_append(eco2: int, tvoc: int) -> None:
+    global _gsheet_ws
+    if not (cfg.gsheet_write and cfg.gsheet_id and cfg.gsheet_credentials):
+        return
+    ts = datetime.now(TZ).isoformat(timespec="seconds")
+    for attempt in range(2):
+        try:
+            _get_ws().append_row([ts, eco2, tvoc], value_input_option="USER_ENTERED")
+            return
+        except Exception as exc:
+            print(f"GSheet write error (attempt {attempt+1}): {exc}",
+                  file=sys.stderr, flush=True)
+            _gsheet_ws = None
+
+def _read_gsheet_since(cutoff: float) -> list[dict]:
+    global _gsheet_ws
+    for attempt in range(2):
+        try:
+            rows = []
+            for row in _get_ws().get_all_records():
+                try:
+                    epoch = datetime.fromisoformat(row["timestamp"]).timestamp()
+                    if epoch >= cutoff:
+                        rows.append({"t": int(epoch),
+                                     "eco2": int(row["eco2_ppm"]),
+                                     "tvoc": int(row["tvoc_ppb"])})
+                except (ValueError, KeyError):
+                    continue
+            return rows
+        except Exception as exc:
+            print(f"GSheet read error (attempt {attempt+1}): {exc}",
+                  file=sys.stderr, flush=True)
+            _gsheet_ws = None
+    return []
+
+# ── Data source dispatch ──────────────────────────────────────────────────────
+def _read_csv_since(cutoff: float) -> list[dict]:
+    rows: list[dict] = []
+    if not LOG_FILE.exists():
+        return rows
+    with open(LOG_FILE, newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                epoch = datetime.fromisoformat(row["timestamp"]).timestamp()
+                if epoch >= cutoff:
+                    rows.append({"t": int(epoch),
+                                 "eco2": int(row["eco2_ppm"]),
+                                 "tvoc": int(row["tvoc_ppb"])})
+            except (ValueError, KeyError):
+                continue
+    return rows
+
+def _read_since(cutoff: float) -> list[dict]:
+    if cfg.gsheet_read and cfg.gsheet_id:
+        return _read_gsheet_since(cutoff)
+    return _read_csv_since(cutoff)
+
+def _process_28d(rows: list[dict]) -> list[dict]:
+    from collections import defaultdict
+    daily_eco2: dict = defaultdict(list)
+    daily_tvoc: dict = defaultdict(list)
+    for r in rows:
+        day = r["t"] // 86400 * 86400
+        daily_eco2[day].append(r["eco2"])
+        daily_tvoc[day].append(r["tvoc"])
+    hourly: dict = defaultdict(list)
+    for r in rows:
+        hourly[r["t"] // 3600 * 3600].append(r)
+    result = []
+    for ts in sorted(hourly):
+        b = hourly[ts]
+        day = ts // 86400 * 86400
+        result.append({
+            "t":        ts,
+            "eco2":     round(sum(r["eco2"] for r in b) / len(b)),
+            "tvoc":     round(sum(r["tvoc"] for r in b) / len(b)),
+            "eco2_dmin": min(daily_eco2[day]),
+            "eco2_dmax": max(daily_eco2[day]),
+            "tvoc_dmin": min(daily_tvoc[day]),
+            "tvoc_dmax": max(daily_tvoc[day]),
+        })
+    return result
+
+# ── Sensor loop (normal mode) ─────────────────────────────────────────────────
 def sensor_loop() -> None:
+    from sgp30 import SGP30
     _ensure_log()
     while True:
         try:
             with SGP30() as sensor:
                 sensor.iaq_init()
                 _load_baseline(sensor)
-
-                with _lock:
-                    _state["phase"] = "warmup"
+                with _lock: _state["phase"] = "warmup"
                 for _ in range(WARMUP_SECONDS):
-                    sensor.measure_iaq()
-                    time.sleep(1)
-
-                with _lock:
-                    _state["phase"] = "running"
-                print("Running.", flush=True)
-
-                last_baseline = time.monotonic()
+                    sensor.measure_iaq(); time.sleep(1)
+                with _lock: _state["phase"] = "running"
+                print("Sensor running.", flush=True)
+                last_baseline = last_log = time.monotonic()
                 last_log = 0.0
-
                 while True:
                     eco2, tvoc = sensor.measure_iaq()
                     ts = datetime.now(TZ).isoformat(timespec="seconds")
@@ -203,88 +279,55 @@ def sensor_loop() -> None:
                     _check_alerts(eco2, tvoc)
                     now = time.monotonic()
                     if now - last_log >= LOG_INTERVAL:
-                        _append_log(eco2, tvoc)
+                        _append_csv(eco2, tvoc)
+                        _gsheet_append(eco2, tvoc)
                         last_log = now
                     if now - last_baseline >= 3600:
-                        _save_baseline(sensor)
-                        last_baseline = now
+                        _save_baseline(sensor); last_baseline = now
                     time.sleep(1)
-
         except Exception as exc:
-            print(f"Sensor error: {exc} — retrying in 5 s", file=sys.stderr, flush=True)
-            with _lock:
-                _state["phase"] = "error"
+            print(f"Sensor error: {exc} — retry in 5 s", file=sys.stderr, flush=True)
+            with _lock: _state["phase"] = "error"
             time.sleep(5)
 
-
-# ── History helpers ───────────────────────────────────────────────────────────
-def _read_csv_since(cutoff_epoch: float) -> list[dict]:
-    rows: list[dict] = []
-    if not LOG_FILE.exists():
-        return rows
-    with open(LOG_FILE, newline="") as f:
-        for row in csv.DictReader(f):
-            try:
-                epoch = datetime.fromisoformat(row["timestamp"]).timestamp()
-                if epoch >= cutoff_epoch:
-                    rows.append({"t": int(epoch),
-                                 "eco2": int(row["eco2_ppm"]),
-                                 "tvoc": int(row["tvoc_ppb"])})
-            except (ValueError, KeyError):
-                continue
-    return rows
-
-
-def _process_28d(rows: list[dict]) -> list[dict]:
-    """Hourly averages with daily min/max envelope from raw 5-min data."""
-    from collections import defaultdict
-
-    daily_eco2: dict = defaultdict(list)
-    daily_tvoc: dict = defaultdict(list)
-    for r in rows:
-        day = r["t"] // 86400 * 86400
-        daily_eco2[day].append(r["eco2"])
-        daily_tvoc[day].append(r["tvoc"])
-
-    hourly: dict = defaultdict(list)
-    for r in rows:
-        hourly[r["t"] // 3600 * 3600].append(r)
-
-    result = []
-    for ts in sorted(hourly):
-        b = hourly[ts]
-        day = ts // 86400 * 86400
-        result.append({
-            "t": ts,
-            "eco2":      round(sum(r["eco2"] for r in b) / len(b)),
-            "tvoc":      round(sum(r["tvoc"] for r in b) / len(b)),
-            "eco2_dmin": min(daily_eco2[day]),
-            "eco2_dmax": max(daily_eco2[day]),
-            "tvoc_dmin": min(daily_tvoc[day]),
-            "tvoc_dmax": max(daily_tvoc[day]),
-        })
-    return result
-
+# ── Google Sheets read loop (dashboard mode — no sensor) ──────────────────────
+def gsheet_read_loop() -> None:
+    """Poll the Sheet every 60 s to populate the current-reading cards."""
+    print("Dashboard mode: reading from Google Sheets.", flush=True)
+    with _lock: _state["phase"] = "running"
+    while True:
+        try:
+            rows = _read_gsheet_since(time.time() - 7200)
+            if rows:
+                r = rows[-1]
+                ts = datetime.fromtimestamp(r["t"], TZ).isoformat(timespec="seconds")
+                with _lock:
+                    _state.update({"eco2": r["eco2"], "tvoc": r["tvoc"],
+                                   "ts": ts, "phase": "running"})
+        except Exception as exc:
+            print(f"GSheet poll error: {exc}", file=sys.stderr, flush=True)
+            with _lock: _state["phase"] = "error"
+        time.sleep(60)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/api/data")
 def api_data():
     with _lock:
-        return jsonify({"current": dict(_state), "history": list(_history)})
-
+        return jsonify({"current": dict(_state),
+                        "history": list(_history),
+                        "mode": "gsheet_read" if cfg.gsheet_read else "sensor"})
 
 @app.route("/api/history")
 def api_history():
     rng = request.args.get("range", "24h")
     now = time.time()
     if rng == "24h":
-        rows = _read_csv_since(now - 86400)
+        rows = _read_since(now - 86400)
     elif rng == "28d":
-        rows = _process_28d(_read_csv_since(now - 28 * 86400))
+        rows = _process_28d(_read_since(now - 28 * 86400))
     else:
         return jsonify({"error": "invalid range"}), 400
     return jsonify({"data": rows})
-
 
 @app.route("/api/download")
 def api_download():
@@ -293,11 +336,9 @@ def api_download():
     return send_file(LOG_FILE, as_attachment=True,
                      download_name="voc_log.csv", mimetype="text/csv")
 
-
 @app.route("/")
 def index():
     return _HTML
-
 
 # ── Embedded dashboard ────────────────────────────────────────────────────────
 _HTML = r"""<!DOCTYPE html>
@@ -382,7 +423,7 @@ td{padding:5px 8px;border-bottom:1px solid #f1f5f9;color:#374151}
   <div><h1>Air Quality Monitor</h1></div>
   <span class="badge ph-starting" id="badge">Starting</span>
 </header>
-<div class="sub" id="sub">Connecting to sensor&hellip;</div>
+<div class="sub" id="sub">Connecting&hellip;</div>
 
 <div class="alert" id="alert-banner"></div>
 
@@ -403,7 +444,7 @@ td{padding:5px 8px;border-bottom:1px solid #f1f5f9;color:#374151}
   </div>
 </div>
 
-<div class="chart-panel">
+<div class="chart-panel" id="live-panel">
   <div class="shd">Live &mdash; Last 5 Minutes</div>
   <div class="crow">
     <div class="clabel2">TVOC (ppb)<span class="minmax" id="mm-tvoc-live"></span></div>
@@ -453,32 +494,31 @@ td{padding:5px 8px;border-bottom:1px solid #f1f5f9;color:#374151}
     <tr><td><span class="dot" style="background:#22c55e"></span>Good</td><td>220&ndash;660 ppb</td><td>Acceptable</td></tr>
     <tr><td><span class="dot" style="background:#f59e0b"></span>Moderate</td><td>660&ndash;2200 ppb</td><td>Open windows or run ventilation</td></tr>
     <tr><td><span class="dot" style="background:#f97316"></span>Poor</td><td>2200&ndash;5500 ppb</td><td>Ventilate now &mdash; ntfy alert sent</td></tr>
-    <tr><td><span class="dot" style="background:#ef4444"></span>Very Poor</td><td>&gt;5500 ppb</td><td>Stop work, ventilate immediately &mdash; urgent alert sent</td></tr>
+    <tr><td><span class="dot" style="background:#ef4444"></span>Very Poor</td><td>&gt;5500 ppb</td><td>Stop work, ventilate immediately &mdash; urgent alert</td></tr>
   </table>
   <h3>eCO&sup2; &mdash; Equivalent CO&sup2;</h3>
   <p>Estimated from VOC readings (not a true CO&sup2; sensor). Tracks real CO&sup2;
-  well in normal occupancy conditions and is a good proxy for whether the space
-  is well-ventilated. Outdoor air &asymp; 400&ndash;420&nbsp;ppm.</p>
+  well in normal occupancy conditions and is a good proxy for ventilation quality.
+  Outdoor air &asymp; 400&ndash;420&nbsp;ppm.</p>
   <table>
     <tr><th>Rating</th><th>eCO&sup2;</th><th>Meaning</th></tr>
     <tr><td><span class="dot" style="background:#10b981"></span>Excellent</td><td>400&ndash;600 ppm</td><td>Well ventilated</td></tr>
     <tr><td><span class="dot" style="background:#22c55e"></span>Good</td><td>600&ndash;1000 ppm</td><td>Acceptable</td></tr>
-    <tr><td><span class="dot" style="background:#f59e0b"></span>Moderate</td><td>1000&ndash;1500 ppm</td><td>Open windows</td></tr>
-    <tr><td><span class="dot" style="background:#f97316"></span>Poor</td><td>1500&ndash;2000 ppm</td><td>Ventilate now &mdash; ntfy alert sent</td></tr>
-    <tr><td><span class="dot" style="background:#ef4444"></span>Very Poor</td><td>&gt;2000 ppm</td><td>Very stuffy &mdash; urgent alert sent</td></tr>
+    <tr><td><span class="dot" style="background:#f59e0b"></span>Moderate</td><td>1000&ndash;1500 ppm</td><td>Getting stuffy &mdash; open a window</td></tr>
+    <tr><td><span class="dot" style="background:#f97316"></span>Poor</td><td>1500&ndash;2000 ppm</td><td>Poor ventilation &mdash; act soon</td></tr>
+    <tr><td><span class="dot" style="background:#ef4444"></span>Very Poor</td><td>&gt;2000 ppm</td><td>Very stuffy &mdash; urgent alert</td></tr>
   </table>
   <div class="note">
-    <strong>28-day chart:</strong> the shaded band shows the full daily min&ndash;max
-    range from 5-minute readings; the line is the hourly average.
-    A break in the line means the sensor was offline or the Pi was off.<br><br>
-    <strong>Calibration:</strong> The SGP30 warms up for 15 s and improves over
-    12 hours. Baseline is saved hourly and restored on restart.
+    <strong>28-day chart:</strong> shaded band = full daily min&ndash;max from
+    5-minute readings; line = hourly average. A break in the line means the
+    sensor was offline.<br><br>
+    <strong>Calibration:</strong> SGP30 warms up for 15 s and improves over
+    12 hours. Baseline saved hourly and restored on restart.
   </div>
 </div>
 
-</div><!-- /wrap -->
+</div>
 <script>
-// ── Level tables ──────────────────────────────────────────────────────────────
 const TVOC_L=[
   {max:220,  color:'#10b981',bg:'#d1fae5',label:'Excellent',desc:'Clean air'},
   {max:660,  color:'#22c55e',bg:'#dcfce7',label:'Good',     desc:'Acceptable indoor air'},
@@ -496,125 +536,93 @@ const ECO2_L=[
 function lvl(v,T){return T.find(l=>v<l.max)||T[T.length-1];}
 
 // ── Tooltip ───────────────────────────────────────────────────────────────────
-const tt = document.getElementById('tt');
-function showTT(html, cx, cy){
-  tt.innerHTML = html;
-  tt.style.display = 'block';
-  const tw=tt.offsetWidth, th=tt.offsetHeight,
-        wx=window.innerWidth, wy=window.innerHeight;
-  let x=cx+14, y=cy-th/2;
-  if(x+tw>wx-8) x=cx-tw-14;
-  if(y<8) y=8;
-  if(y+th>wy-8) y=wy-th-8;
+const tt=document.getElementById('tt');
+function showTT(html,cx,cy){
+  tt.innerHTML=html; tt.style.display='block';
+  const tw=tt.offsetWidth,th=tt.offsetHeight,wx=window.innerWidth,wy=window.innerHeight;
+  let x=cx+14,y=cy-th/2;
+  if(x+tw>wx-8)x=cx-tw-14; if(y<8)y=8; if(y+th>wy-8)y=wy-th-8;
   tt.style.left=x+'px'; tt.style.top=y+'px';
 }
-function hideTT(){ tt.style.display='none'; }
+function hideTT(){tt.style.display='none';}
 
-// ── Chart store (for tooltip hit-testing) ─────────────────────────────────────
-const _cs = {}; // canvasId → {data, key, ML, PW, lo, span}
+// ── Chart store ───────────────────────────────────────────────────────────────
+const _cs={};
 
-// ── Chart drawing ─────────────────────────────────────────────────────────────
-function drawChart(id, data, key, color, gapSec, range, mmId, envMin, envMax){
-  const canvas = document.getElementById(id);
-  if(!canvas) return;
-
-  const vals = data.map(d=>d[key]);
-  if(mmId && vals.length){
-    const lo=Math.min(...vals), hi=Math.max(...vals);
-    document.getElementById(mmId).textContent = `min ${lo}  max ${hi}`;
+function drawChart(id,data,key,color,gapSec,range,mmId,envMin,envMax){
+  const canvas=document.getElementById(id); if(!canvas) return;
+  const vals=data.map(d=>d[key]);
+  if(mmId&&vals.length){
+    const lo=Math.min(...vals),hi=Math.max(...vals);
+    document.getElementById(mmId).textContent=`min ${lo}  max ${hi}`;
   }
-  if(vals.length < 2) return;
-
+  if(vals.length<2) return;
   const dpr=window.devicePixelRatio||1;
   const rect=canvas.getBoundingClientRect();
   canvas.width=rect.width*dpr; canvas.height=rect.height*dpr;
-  const ctx=canvas.getContext('2d');
-  ctx.scale(dpr,dpr);
-  const W=rect.width, H=rect.height;
-  const ML=46,MR=6,MT=8,MB=20;
-  const PW=W-ML-MR, PH=H-MT-MB;
+  const ctx=canvas.getContext('2d'); ctx.scale(dpr,dpr);
+  const W=rect.width,H=rect.height,ML=46,MR=6,MT=8,MB=20;
+  const PW=W-ML-MR,PH=H-MT-MB;
+  const envLo=envMin?Math.min(...data.map(d=>d[envMin])):Infinity;
+  const envHi=envMax?Math.max(...data.map(d=>d[envMax])):-Infinity;
+  const lo=Math.min(Math.min(...vals),envLo),hi=Math.max(Math.max(...vals),envHi);
+  const span=(hi-lo)||1;
+  const px=i=>ML+(i/(vals.length-1))*PW;
+  const py=v=>MT+PH*(0.94-0.88*(v-lo)/span);
+  _cs[id]={data,key,range,ML,PW,lo,span,MT,PH,envMin,envMax,color};
 
-  // value extents — include envelope in scale so band fits
-  const envLo = envMin ? Math.min(...data.map(d=>d[envMin])) : Infinity;
-  const envHi = envMax ? Math.max(...data.map(d=>d[envMax])) : -Infinity;
-  const lo = Math.min(Math.min(...vals), envLo);
-  const hi = Math.max(Math.max(...vals), envHi);
-  const span = (hi-lo)||1;
-
-  const px = i => ML + (i/(vals.length-1))*PW;
-  const py = v => MT + PH*(0.94 - 0.88*(v-lo)/span);
-
-  // Store for tooltip
-  _cs[id] = {data, key, range, ML, PW, lo, span, MT, PH,
-              envMin, envMax, color};
-
-  // Background
+  // Background + axes
   ctx.fillStyle='#f8fafc'; ctx.fillRect(ML,MT,PW,PH);
-
-  // Axes
   ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1;
   ctx.beginPath(); ctx.moveTo(ML,MT); ctx.lineTo(ML,MT+PH);
   ctx.moveTo(ML,MT+PH); ctx.lineTo(ML+PW,MT+PH); ctx.stroke();
 
   // Y labels
-  ctx.font='10px system-ui,sans-serif'; ctx.fillStyle='#94a3b8';
-  ctx.textAlign='right';
-  ctx.textBaseline='top';    ctx.fillText(Math.round(hi),       ML-4, MT+1);
+  ctx.font='10px system-ui,sans-serif'; ctx.fillStyle='#94a3b8'; ctx.textAlign='right';
+  ctx.textBaseline='top';    ctx.fillText(Math.round(hi),        ML-4,MT+1);
   ctx.textBaseline='middle'; ctx.fillStyle='#cbd5e1';
-                              ctx.fillText(Math.round((lo+hi)/2),ML-4, MT+PH*0.47);
+                              ctx.fillText(Math.round((lo+hi)/2), ML-4,MT+PH*0.47);
   ctx.textBaseline='bottom'; ctx.fillStyle='#94a3b8';
-                              ctx.fillText(Math.round(lo),       ML-4, MT+PH-1);
+                              ctx.fillText(Math.round(lo),        ML-4,MT+PH-1);
 
   // X labels
-  const n=vals.length;
-  const step=Math.max(1,Math.floor(n/5));
-  const fmtX = range==='24h'
-    ? t=>{ const d=new Date(t*1000); return String(d.getHours()).padStart(2,'0')+':00'; }
-    : range==='28d'
-    ? t=>new Date(t*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})
-    : t=>{ const d=new Date(t*1000);
-           return String(d.getHours()).padStart(2,'0')+':'+
-                  String(d.getMinutes()).padStart(2,'0'); };
+  const n=vals.length, step=Math.max(1,Math.floor(n/5));
+  const fmtX=range==='24h'
+    ?t=>{const d=new Date(t*1000);return String(d.getHours()).padStart(2,'0')+':00';}
+    :range==='28d'
+    ?t=>new Date(t*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})
+    :t=>{const d=new Date(t*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
   ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle='#94a3b8';
   for(let i=0;i<n;i+=step){
     const x=px(i);
     ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(x,MT+PH); ctx.lineTo(x,MT+PH+4); ctx.stroke();
-    ctx.fillText(fmtX(data[i].t), x, MT+PH+5);
+    ctx.fillText(fmtX(data[i].t),x,MT+PH+5);
   }
 
-  // Daily range envelope (28d only)
-  if(envMin && envMax){
-    ctx.globalAlpha=0.15; ctx.fillStyle=color;
-    ctx.beginPath();
-    for(let i=0;i<n;i++){
-      const x=px(i), y=py(data[i][envMax]||vals[i]);
-      i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
-    }
-    for(let i=n-1;i>=0;i--) ctx.lineTo(px(i), py(data[i][envMin]||vals[i]));
+  // Daily envelope
+  if(envMin&&envMax){
+    ctx.globalAlpha=0.15; ctx.fillStyle=color; ctx.beginPath();
+    for(let i=0;i<n;i++){const x=px(i),y=py(data[i][envMax]||vals[i]); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
+    for(let i=n-1;i>=0;i--)ctx.lineTo(px(i),py(data[i][envMin]||vals[i]));
     ctx.closePath(); ctx.fill(); ctx.globalAlpha=1;
   }
 
-  // Main line with gap detection
+  // Line with gap detection
   ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=1.8; ctx.lineJoin='round';
   for(let i=0;i<n;i++){
-    const gap = i>0 && (data[i].t - data[i-1].t) > gapSec;
-    gap||i===0 ? ctx.moveTo(px(i),py(vals[i])) : ctx.lineTo(px(i),py(vals[i]));
+    const gap=i>0&&(data[i].t-data[i-1].t)>gapSec;
+    gap||i===0?ctx.moveTo(px(i),py(vals[i])):ctx.lineTo(px(i),py(vals[i]));
   }
   ctx.stroke();
 
   // Area fill
-  ctx.globalAlpha=0.10; ctx.fillStyle=color;
-  let open=false; ctx.beginPath();
+  ctx.globalAlpha=0.10; ctx.fillStyle=color; let open=false; ctx.beginPath();
   for(let i=0;i<n;i++){
-    const x=px(i), y=py(vals[i]);
-    const gap = i>0 && (data[i].t - data[i-1].t) > gapSec;
-    if(gap||i===0){
-      if(open){ ctx.lineTo(px(i-1),MT+PH); ctx.closePath(); ctx.fill(); ctx.beginPath(); }
-      ctx.moveTo(x,MT+PH); ctx.lineTo(x,y); open=true;
-    } else { ctx.lineTo(x,y); }
+    const x=px(i),y=py(vals[i]),gap=i>0&&(data[i].t-data[i-1].t)>gapSec;
+    if(gap||i===0){if(open){ctx.lineTo(px(i-1),MT+PH);ctx.closePath();ctx.fill();ctx.beginPath();}ctx.moveTo(x,MT+PH);ctx.lineTo(x,y);open=true;}else ctx.lineTo(x,y);
   }
-  if(open){ ctx.lineTo(px(n-1),MT+PH); ctx.closePath(); ctx.fill(); }
+  if(open){ctx.lineTo(px(n-1),MT+PH);ctx.closePath();ctx.fill();}
   ctx.globalAlpha=1;
 
   // Terminal dot
@@ -623,49 +631,41 @@ function drawChart(id, data, key, color, gapSec, range, mmId, envMin, envMax){
 }
 
 // ── Tooltip hit-testing ───────────────────────────────────────────────────────
-function chartHover(e, canvasId){
-  const s=_cs[canvasId]; if(!s||s.data.length<2) return;
-  const rect=document.getElementById(canvasId).getBoundingClientRect();
-  const mx = (e.touches?e.touches[0].clientX:e.clientX) - rect.left;
-  const cx =  e.touches?e.touches[0].clientX:e.clientX;
-  const cy =  e.touches?e.touches[0].clientY:e.clientY;
-  const frac=Math.max(0,Math.min(1,(mx-s.ML)/s.PW));
+function chartHover(e,id){
+  const s=_cs[id]; if(!s||s.data.length<2) return;
+  const rect=document.getElementById(id).getBoundingClientRect();
+  const cx=e.touches?e.touches[0].clientX:e.clientX;
+  const cy=e.touches?e.touches[0].clientY:e.clientY;
+  const frac=Math.max(0,Math.min(1,(cx-rect.left-s.ML)/s.PW));
   const idx=Math.round(frac*(s.data.length-1));
-  const pt=s.data[idx]; if(!pt) return;
-  const val=pt[s.key];
-  const unit=s.key==='tvoc'?'ppb':'ppm';
-  const l=lvl(val, s.key==='tvoc'?TVOC_L:ECO2_L);
+  const pt=s.data[Math.max(0,Math.min(s.data.length-1,idx))]; if(!pt) return;
+  const val=pt[s.key], unit=s.key==='tvoc'?'ppb':'ppm';
+  const l=lvl(val,s.key==='tvoc'?TVOC_L:ECO2_L);
   const d=new Date(pt.t*1000);
-  const ts = s.range==='28d'
-    ? d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})
-    : s.range==='24h'
-    ? d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
-    : d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const ts=s.range==='28d'?d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})
+    :s.range==='24h'?d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
+    :d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
   let html=`<b>${ts}</b><br>${val} ${unit} &mdash; <span style="color:${l.color}">${l.label}</span>`;
-  if(s.envMin && pt[s.envMin]!==undefined)
+  if(s.envMin&&pt[s.envMin]!==undefined)
     html+=`<br><span style="color:#94a3b8;font-size:.7rem">Day ${pt[s.envMin]}–${pt[s.envMax]} ${unit}</span>`;
-  showTT(html, cx, cy);
+  showTT(html,cx,cy);
 }
-
-function attachTooltip(id, envMin, envMax){
-  const c=document.getElementById(id); if(!c||c._tt) return;
-  c._tt=true;
-  c.addEventListener('mousemove', e=>chartHover(e,id));
-  c.addEventListener('mouseleave', hideTT);
-  c.addEventListener('touchmove',  e=>{ e.preventDefault(); chartHover(e,id); },{passive:false});
-  c.addEventListener('touchend',   hideTT);
+function attachTT(id){
+  const c=document.getElementById(id); if(!c||c._tt) return; c._tt=true;
+  c.addEventListener('mousemove',e=>chartHover(e,id));
+  c.addEventListener('mouseleave',hideTT);
+  c.addEventListener('touchmove',e=>{e.preventDefault();chartHover(e,id);},{passive:false});
+  c.addEventListener('touchend',hideTT);
 }
-['tvoc-live','eco2-live','tvoc-24h','eco2-24h','tvoc-28d','eco2-28d']
-  .forEach(id=>attachTooltip(id));
+['tvoc-live','eco2-live','tvoc-24h','eco2-24h','tvoc-28d','eco2-28d'].forEach(attachTT);
 
 // ── Alert banner ──────────────────────────────────────────────────────────────
 let _prevBad=false;
 function updateAlert(tvoc,eco2){
-  const tl=lvl(tvoc,TVOC_L), el=lvl(eco2,ECO2_L);
-  const b=document.getElementById('alert-banner');
-  const msgs=[];
-  if(tvoc>=2200) msgs.push(`TVOC ${tl.label}: ${tvoc} ppb — ${tl.desc}.`);
-  if(eco2>=1500) msgs.push(`eCO₂ ${el.label}: ${eco2} ppm — ${el.desc}.`);
+  const tl=lvl(tvoc,TVOC_L),el=lvl(eco2,ECO2_L);
+  const b=document.getElementById('alert-banner'), msgs=[];
+  if(tvoc>=2200)msgs.push(`TVOC ${tl.label}: ${tvoc} ppb — ${tl.desc}.`);
+  if(eco2>=1500)msgs.push(`eCO₂ ${el.label}: ${eco2} ppm — ${el.desc}.`);
   if(msgs.length){
     b.textContent=msgs.join(' ');
     b.className='alert '+(tvoc>=5500||eco2>=2000?'alert-crit':'alert-warn');
@@ -678,19 +678,27 @@ function updateAlert(tvoc,eco2){
 
 // ── Phase badge ───────────────────────────────────────────────────────────────
 const PHASE={
-  starting:['Starting…','ph-starting'],
-  warmup:  ['Warming up…','ph-warmup'],
-  running: ['Running','ph-running'],
-  error:   ['Sensor error','ph-error'],
+  starting:['Starting…','ph-starting'],warmup:['Warming up…','ph-warmup'],
+  running:['Running','ph-running'],error:['Sensor error','ph-error'],
 };
 
-// ── Live poll (every 2 s) ─────────────────────────────────────────────────────
+// ── Live poll ─────────────────────────────────────────────────────────────────
+let _gsheetRead=false;
 async function fetchLive(){
   try{
-    const {current:c,history:h}=await(await fetch('/api/data')).json();
+    const {current:c,history:h,mode}=await(await fetch('/api/data')).json();
+
+    // Hide live panel in Google Sheets read mode
+    if(mode==='gsheet_read'){
+      _gsheetRead=true;
+      document.getElementById('live-panel').style.display='none';
+      document.getElementById('sub').textContent='Showing data from Google Sheets';
+    }
+
     const[pl,pc]=PHASE[c.phase]||PHASE.starting;
     const b=document.getElementById('badge'); b.textContent=pl; b.className='badge '+pc;
-    if(c.ts) document.getElementById('sub').textContent='SGP30 · Updated '+c.ts.slice(11,19);
+    if(c.ts&&!_gsheetRead)
+      document.getElementById('sub').textContent='SGP30 · Updated '+c.ts.slice(11,19);
     if(c.tvoc!==null){
       const l=lvl(c.tvoc,TVOC_L);
       const v=document.getElementById('tvoc-val'); v.textContent=c.tvoc; v.style.color=l.color;
@@ -706,7 +714,7 @@ async function fetchLive(){
       document.getElementById('eco2-desc').textContent=l.desc;
     }
     if(c.tvoc!==null&&c.eco2!==null) updateAlert(c.tvoc,c.eco2);
-    if(h.length>1){
+    if(!_gsheetRead&&h.length>1){
       const tc=c.tvoc!==null?lvl(c.tvoc,TVOC_L).color:'#64748b';
       const ec=c.eco2!==null?lvl(c.eco2,ECO2_L).color:'#64748b';
       drawChart('tvoc-live',h,'tvoc',tc,120,'5m','mm-tvoc-live',null,null);
@@ -718,36 +726,38 @@ async function fetchLive(){
   }
 }
 
-// ── Historical charts (every 5 min) ──────────────────────────────────────────
+// ── Historical charts ─────────────────────────────────────────────────────────
 async function fetchHistory(range){
   try{
     const {data}=await(await fetch('/api/history?range='+range)).json();
     if(!data||data.length<2) return;
     const last=data[data.length-1];
-    const tc=lvl(last.tvoc,TVOC_L).color, ec=lvl(last.eco2,ECO2_L).color;
+    const tc=lvl(last.tvoc,TVOC_L).color,ec=lvl(last.eco2,ECO2_L).color;
     const gapSec=range==='28d'?10800:600;
-    const [tMin,tMax,eMin,eMax]=range==='28d'
-      ?['tvoc_dmin','tvoc_dmax','eco2_dmin','eco2_dmax']
-      :[null,null,null,null];
+    const[tMin,tMax,eMin,eMax]=range==='28d'
+      ?['tvoc_dmin','tvoc_dmax','eco2_dmin','eco2_dmax']:[null,null,null,null];
     drawChart(`tvoc-${range}`,data,'tvoc',tc,gapSec,range,`mm-tvoc-${range}`,tMin,tMax);
     drawChart(`eco2-${range}`,data,'eco2',ec,gapSec,range,`mm-eco2-${range}`,eMin,eMax);
-  }catch(e){ console.warn('history',range,e); }
+  }catch(e){console.warn('history',range,e);}
 }
 
-function refreshAll(){ fetchHistory('24h'); fetchHistory('28d'); }
-
-fetchLive();
-refreshAll();
-setInterval(fetchLive, 2000);
-setInterval(refreshAll, 300000);
-window.addEventListener('resize', ()=>{ fetchLive(); refreshAll(); });
+function refreshAll(){fetchHistory('24h');fetchHistory('28d');}
+fetchLive(); refreshAll();
+setInterval(fetchLive,2000); setInterval(refreshAll,300000);
+window.addEventListener('resize',()=>{fetchLive();refreshAll();});
 </script>
 </body>
 </html>"""
 
 
 if __name__ == "__main__":
-    _load_config()
-    threading.Thread(target=sensor_loop, daemon=True).start()
-    print(f"Dashboard: http://0.0.0.0:{PORT}", flush=True)
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    if cfg.ntfy_url:
+        print(f"ntfy alerts → {cfg.ntfy_url}", flush=True)
+    if cfg.gsheet_write:
+        print(f"GSheet write → {cfg.gsheet_id} / {cfg.gsheet_worksheet}", flush=True)
+    if cfg.gsheet_read:
+        threading.Thread(target=gsheet_read_loop, daemon=True).start()
+    else:
+        threading.Thread(target=sensor_loop, daemon=True).start()
+    print(f"Dashboard: http://0.0.0.0:{cfg.port}", flush=True)
+    app.run(host="0.0.0.0", port=cfg.port, debug=False, use_reloader=False)

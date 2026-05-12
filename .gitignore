@@ -24,6 +24,11 @@ baseline.json
 # CSV logs
 *.csv
 
+# Google Sheets service account credentials — never commit these
+*credentials*.json
+*service_account*.json
+*serviceaccount*.json
+
 # Editor / OS
 .DS_Store
 .idea/

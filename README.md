@@ -50,6 +50,48 @@ Find your Pi's IP with `hostname -I`.
 
 ---
 
+## Configuration
+
+Settings live in **`config.py`** in the repo directory.  This file is committed
+to git and contains safe defaults — never put secrets in it.
+
+To override any setting without touching the committed file, create:
+
+```
+~/.config/voc/config.py
+```
+
+That file is never committed to git.  Put only the keys you want to change:
+
+```python
+# ~/.config/voc/config.py
+NTFY_URL    = "https://ntfy.sh/my-private-topic"
+GSHEET_ID   = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+GSHEET_CREDENTIALS = "/home/pi/.config/voc/credentials.json"
+GSHEET_WRITE = True
+```
+
+Restart the service after any config change:
+
+```bash
+sudo systemctl restart voc
+```
+
+### All configuration keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PORT` | `8080` | Web dashboard port |
+| `NTFY_URL` | `"https://ntfy.sh/slvmakerspace-voc"` | ntfy topic URL; `""` disables alerts |
+| `NTFY_COOLDOWN_MINUTES` | `30` | Minutes between repeated alerts while bad |
+| `GSHEET_WRITE` | `False` | Append every 5-min reading to a Google Sheet |
+| `GSHEET_ID` | `""` | Spreadsheet ID from its URL |
+| `GSHEET_WORKSHEET` | `"Sheet1"` | Tab name inside the spreadsheet |
+| `GSHEET_CREDENTIALS` | `""` | Absolute path to service account JSON key |
+| `GSHEET_READ` | `False` | Dashboard mode — read charts from Sheet, no sensor needed |
+
+---
+
 ## ntfy push alerts
 
 The service sends push notifications to **[ntfy.sh](https://ntfy.sh)** when air
@@ -57,14 +99,11 @@ quality reaches **Poor** or worse.  No account is required for the free hosted t
 
 ### Setup
 
-1. Edit `config.json` in the repo directory:
-   ```json
-   {
-     "ntfy_url": "https://ntfy.sh/slvmakerspace-voc",
-     "ntfy_cooldown_minutes": 30
-   }
+1. Edit `~/.config/voc/config.py` (or `config.py` in the repo directory):
+   ```python
+   NTFY_URL = "https://ntfy.sh/my-space-air"   # pick any topic name
    ```
-   Pick any topic name you like — keep it hard to guess if you want it semi-private.
+   Keep the topic name hard to guess if you want it semi-private.
 
 2. Restart the service to pick up the new config:
    ```bash
@@ -73,8 +112,8 @@ quality reaches **Poor** or worse.  No account is required for the free hosted t
 
 3. Subscribe on your phone:
    - **iOS / Android:** install the [ntfy app](https://ntfy.sh) and subscribe to your topic
-   - **Browser:** open `https://ntfy.sh/slvmakerspace-voc` and click Subscribe
-   - **Self-hosted:** change `ntfy_url` to point at your own ntfy server
+   - **Browser:** open your topic URL and click Subscribe
+   - **Self-hosted:** change `NTFY_URL` to point at your own ntfy server
 
 ### What triggers an alert
 
@@ -87,7 +126,7 @@ quality reaches **Poor** or worse.  No account is required for the free hosted t
 | Returns below Poor | Default | All-clear sent |
 
 A re-alert fires every 30 minutes (configurable) while the space remains in a Poor
-or worse state.  ntfy alerts are disabled if `ntfy_url` is left empty.
+or worse state.  ntfy alerts are disabled if `NTFY_URL` is left empty.
 
 ### What to watch for in a makerspace
 
@@ -104,6 +143,59 @@ Common causes of elevated VOC readings and what to do:
 
 ---
 
+## Google Sheets integration
+
+Two optional modes let you use a Google Sheet for persistent storage and
+multi-device dashboards.
+
+### Write mode — log readings to a Sheet
+
+Every 5-minute reading is appended to a Google Sheet *in addition* to the local CSV.
+
+**One-time setup:**
+
+1. Create a Google Cloud project and enable the **Google Sheets API**.
+2. Create a **service account** and download its JSON key file.
+3. **Share** your spreadsheet with the service account e-mail address (Editor role).
+4. Install the extra Python packages:
+   ```bash
+   cd /path/to/voc
+   .venv/bin/pip install gspread google-auth
+   ```
+   (Or uncomment those lines in `requirements.txt` and re-run `install.sh`.)
+5. Add to `~/.config/voc/config.py`:
+   ```python
+   GSHEET_WRITE       = True
+   GSHEET_ID          = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+   GSHEET_WORKSHEET   = "Sheet1"
+   GSHEET_CREDENTIALS = "/home/pi/.config/voc/credentials.json"
+   ```
+6. Restart the service: `sudo systemctl restart voc`
+
+The spreadsheet will receive rows in the format:
+```
+timestamp,eco2_ppm,tvoc_ppb
+2025-05-12T14:30:00-07:00,512,42
+```
+
+### Read / dashboard mode — no sensor required
+
+When `GSHEET_READ = True`, the dashboard reads all chart data from the Google Sheet
+instead of the local CSV.  The live 5-minute chart is hidden because no sensor data
+is available.  This is useful for a second Pi (or laptop) acting as a display.
+
+Requires `GSHEET_ID`, `GSHEET_WORKSHEET`, and `GSHEET_CREDENTIALS` to be set.
+
+```python
+# ~/.config/voc/config.py on the display-only machine
+GSHEET_READ        = True
+GSHEET_ID          = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+GSHEET_WORKSHEET   = "Sheet1"
+GSHEET_CREDENTIALS = "/home/pi/.config/voc/credentials.json"
+```
+
+---
+
 ## Web dashboard
 
 The dashboard auto-updates every 2 seconds and shows:
@@ -111,8 +203,8 @@ The dashboard auto-updates every 2 seconds and shows:
 - **Current TVOC and eCO₂** with color-coded ratings and descriptions
 - **Alert banner** when either reading reaches Poor or worse
 - **Three chart panels** — each with Y-axis min/mid/max labels and X-axis time labels:
-  - *Live (last 5 min)* — 1 Hz in-memory buffer
-  - *Last 24 hours* — from the 5-minute CSV log
+  - *Live (last 5 min)* — 1 Hz in-memory buffer (hidden in `GSHEET_READ` mode)
+  - *Last 24 hours* — from the 5-minute CSV log (or Google Sheet)
   - *Last 28 days* — hourly averages; shaded band shows full daily min–max range
 - **Gaps in data** (sensor offline, Pi rebooted) appear as breaks in the line
 - **Hover / touch** any chart to see the exact timestamp and value at that point
@@ -122,7 +214,7 @@ The dashboard auto-updates every 2 seconds and shows:
 
 ```bash
 sudo systemctl status voc        # running?
-sudo systemctl restart voc       # restart (e.g. after editing config.json)
+sudo systemctl restart voc       # restart (e.g. after editing config)
 sudo journalctl -u voc -f        # live logs
 sudo systemctl stop voc
 sudo systemctl disable voc       # don't start on boot
@@ -197,11 +289,11 @@ accurate by `systemd-timesyncd` (NTP).
 |-------------------|---------|
 | `sgp30.py`        | Low-level SGP30 driver (smbus2, raw I²C) |
 | `voc_web.py`      | Flask web dashboard + sensor loop + ntfy alerts |
-| `config.json`     | ntfy URL and alert cooldown (edit this) |
+| `config.py`       | All settings with defaults (edit or override via `~/.config/voc/config.py`) |
 | `read_voc.py`     | Single or repeated CLI readings |
 | `monitor_voc.py`  | Continuous terminal monitoring with auto-baseline |
 | `save_baseline.py`| Save current sensor baseline to `baseline.json` |
 | `load_baseline.py`| Load `baseline.json` and apply to sensor |
 | `baseline.json`   | Saved calibration (auto-created, not in git) |
 | `install.sh`      | One-time setup: I²C, venv, packages, systemd service |
-| `requirements.txt`| Python dependencies (`smbus2`, `flask`, `tzdata`) |
+| `requirements.txt`| Python dependencies (`smbus2`, `flask`, `tzdata`; optional `gspread`) |

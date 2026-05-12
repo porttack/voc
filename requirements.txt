@@ -1,3 +1,7 @@
 smbus2>=0.4.3
 flask>=2.3
 tzdata>=2024.1
+
+# Optional – Google Sheets integration (uncomment and re-run install.sh to enable)
+# gspread>=6.0
+# google-auth>=2.0
