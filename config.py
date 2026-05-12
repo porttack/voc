@@ -48,3 +48,15 @@ GSHEET_CREDENTIALS = ""         # Absolute path to the service account JSON key
 #
 # Requires GSHEET_ID, GSHEET_WORKSHEET, and GSHEET_CREDENTIALS above.
 GSHEET_READ = False
+
+# ── TLS / HTTPS ────────────────────────────────────────────────────────────────
+# When both paths are set, the dashboard also listens on port 443 with HTTPS.
+# install.sh generates a self-signed certificate automatically and writes the
+# paths into ~/.config/voc/config.py — you shouldn't need to edit these.
+#
+# To use your own certificate (e.g. from Let's Encrypt):
+#   SSL_CERT = "/etc/letsencrypt/live/<domain>/fullchain.pem"
+#   SSL_KEY  = "/etc/letsencrypt/live/<domain>/privkey.pem"
+#
+SSL_CERT = ""   # Absolute path to TLS certificate (PEM)
+SSL_KEY  = ""   # Absolute path to TLS private key (PEM)

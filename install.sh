@@ -64,7 +64,42 @@ echo "Installing Python packages into venv…"
 "$VENV/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
 ###############################################################################
-# 4. Point script shebangs at the venv Python and make them executable
+# 4. Generate self-signed TLS certificate (skip if already present)
+###############################################################################
+CERT_DIR="/etc/voc"
+SSL_CERT="$CERT_DIR/cert.pem"
+SSL_KEY="$CERT_DIR/key.pem"
+USER_CFG_DIR="$HOME/.config/voc"
+USER_CFG="$USER_CFG_DIR/config.py"
+
+if [ ! -f "$SSL_CERT" ] || [ ! -f "$SSL_KEY" ]; then
+    echo ""
+    echo "Generating self-signed TLS certificate (valid 10 years)…"
+    sudo mkdir -p "$CERT_DIR"
+    sudo openssl req -x509 -newkey rsa:2048 \
+        -keyout "$SSL_KEY" \
+        -out    "$SSL_CERT" \
+        -days 3650 -nodes \
+        -subj "/CN=$(hostname -s)" 2>/dev/null
+    # Private key readable only by root and the service user
+    sudo chown root:"$INSTALL_USER" "$SSL_KEY"
+    sudo chmod 640 "$SSL_KEY"
+    sudo chmod 644 "$SSL_CERT"
+    echo "Certificate: $SSL_CERT"
+else
+    echo "TLS certificate already exists at $SSL_CERT — skipping"
+fi
+
+# Write cert paths into the user config override (only once)
+mkdir -p "$USER_CFG_DIR"
+if ! grep -q "SSL_CERT" "$USER_CFG" 2>/dev/null; then
+    printf '\n# TLS — written by install.sh\nSSL_CERT = "%s"\nSSL_KEY  = "%s"\n' \
+        "$SSL_CERT" "$SSL_KEY" >> "$USER_CFG"
+    echo "SSL paths written to $USER_CFG"
+fi
+
+###############################################################################
+# 5. Point script shebangs at the venv Python and make them executable
 ###############################################################################
 for script in read_voc.py save_baseline.py load_baseline.py monitor_voc.py voc_web.py; do
     sed -i "1s|.*|#!${VENV_PYTHON}|" "$INSTALL_DIR/$script"
@@ -72,7 +107,7 @@ for script in read_voc.py save_baseline.py load_baseline.py monitor_voc.py voc_w
 done
 
 ###############################################################################
-# 5. Install and enable systemd service (uses venv Python)
+# 6. Install and enable systemd service (uses venv Python)
 ###############################################################################
 SERVICE=/etc/systemd/system/voc.service
 
@@ -92,6 +127,8 @@ Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+# Allow binding port 443 without running as root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -111,14 +148,13 @@ echo ""
 echo " Service status:"
 sudo systemctl status voc --no-pager -l || true
 echo ""
-echo " Dashboard:  http://$(hostname -I | awk '{print $1}'):8080"
+echo " Dashboard HTTP:  http://$(hostname -I | awk '{print $1}'):8080"
+echo " Dashboard HTTPS: https://$(hostname -I | awk '{print $1}')  (self-signed cert)"
 echo ""
-echo " To run scripts manually, activate the venv first:"
-echo "   source $VENV/bin/activate"
-echo "   python3 read_voc.py"
-echo "   deactivate"
+echo " Note: browsers will warn about the self-signed certificate — click"
+echo " 'Advanced' and proceed.  The connection is still encrypted."
 echo ""
-echo " Or call the venv Python directly:"
+echo " To run scripts manually (no activation needed):"
 echo "   $VENV_PYTHON read_voc.py"
 echo ""
 echo " Service commands:"

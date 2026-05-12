@@ -27,6 +27,8 @@ class _Cfg:
     gsheet_worksheet:      str  = "Sheet1"
     gsheet_credentials:    str  = ""
     gsheet_read:           bool = False
+    ssl_cert:              str  = ""
+    ssl_key:               str  = ""
 
     @property
     def ntfy_cooldown(self) -> float:
@@ -761,5 +763,16 @@ if __name__ == "__main__":
         threading.Thread(target=gsheet_read_loop, daemon=True).start()
     else:
         threading.Thread(target=sensor_loop, daemon=True).start()
-    print(f"Dashboard: http://0.0.0.0:{cfg.port}", flush=True)
+
+    # Optional HTTPS on port 443 — runs alongside HTTP in a background thread
+    if cfg.ssl_cert and cfg.ssl_key and os.path.exists(cfg.ssl_cert) and os.path.exists(cfg.ssl_key):
+        from werkzeug.serving import make_server
+        def _run_https():
+            srv = make_server("0.0.0.0", 443, app,
+                              ssl_context=(cfg.ssl_cert, cfg.ssl_key))
+            print(f"Dashboard HTTPS: https://0.0.0.0:443", flush=True)
+            srv.serve_forever()
+        threading.Thread(target=_run_https, daemon=True).start()
+
+    print(f"Dashboard HTTP:  http://0.0.0.0:{cfg.port}", flush=True)
     app.run(host="0.0.0.0", port=cfg.port, debug=False, use_reloader=False)
