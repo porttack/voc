@@ -271,8 +271,9 @@ def sensor_loop() -> None:
                     sensor.measure_iaq(); time.sleep(1)
                 with _lock: _state["phase"] = "running"
                 print("Sensor running.", flush=True)
-                last_baseline = last_log = time.monotonic()
+                last_baseline = time.monotonic()
                 last_log = 0.0
+                max_eco2 = max_tvoc = 0
                 while True:
                     eco2, tvoc = sensor.measure_iaq()
                     ts = datetime.now(TZ).isoformat(timespec="seconds")
@@ -281,10 +282,13 @@ def sensor_loop() -> None:
                         _history.append({"t": int(time.time()),
                                          "eco2": eco2, "tvoc": tvoc})
                     _check_alerts(eco2, tvoc)
+                    max_eco2 = max(max_eco2, eco2)
+                    max_tvoc = max(max_tvoc, tvoc)
                     now = time.monotonic()
                     if now - last_log >= LOG_INTERVAL:
-                        _append_csv(eco2, tvoc)
-                        _gsheet_append(eco2, tvoc)
+                        _append_csv(max_eco2, max_tvoc)
+                        _gsheet_append(max_eco2, max_tvoc)
+                        max_eco2 = max_tvoc = 0
                         last_log = now
                     if now - last_baseline >= 3600:
                         _save_baseline(sensor); last_baseline = now
