@@ -105,6 +105,9 @@ for script in read_voc.py save_baseline.py load_baseline.py monitor_voc.py voc_w
     sed -i "1s|.*|#!${VENV_PYTHON}|" "$INSTALL_DIR/$script"
     chmod +x "$INSTALL_DIR/$script"
 done
+# Tell git to ignore the shebang rewrites so 'git status' stays clean
+git -C "$INSTALL_DIR" update-index --assume-unchanged \
+    read_voc.py save_baseline.py load_baseline.py monitor_voc.py voc_web.py 2>/dev/null || true
 
 ###############################################################################
 # 6. Install and enable systemd service (uses venv Python)
