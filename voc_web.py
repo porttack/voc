@@ -543,7 +543,8 @@ const ECO2_L=[
 ];
 function lvl(v,T){return T.find(l=>v<l.max)||T[T.length-1];}
 
-// ── Tooltip ─────────────────────────────────────────────────────────────────────────────────\nconst tt=document.getElementById('tt');
+// ── Tooltip ─────────────────────────────────────────────────────────────────────────────────
+const tt=document.getElementById('tt');
 function showTT(html,cx,cy){
   tt.innerHTML=html; tt.style.display='block';
   const tw=tt.offsetWidth,th=tt.offsetHeight,wx=window.innerWidth,wy=window.innerHeight;
@@ -643,7 +644,8 @@ function drawChart(id,data,key,LEVELS,gapSec,tStart,tEnd,mmId,envMin,envMax){
   ctx.fillStyle=lvl(vals[data.length-1],LEVELS).color; ctx.fill();
 }
 
-// ── Tooltip hit-testing ────────────────────────────────────────────────────────────────────────────\nfunction chartHover(e,id){
+// ── Tooltip hit-testing ────────────────────────────────────────────────────────────────────────────
+function chartHover(e,id){
   const s=_cs[id]; if(!s||s.data.length<2) return;
   const rect=document.getElementById(id).getBoundingClientRect();
   const cx=e.touches?e.touches[0].clientX:e.clientX;
@@ -676,7 +678,8 @@ function attachTT(id){
 }
 ['tvoc-live','eco2-live','tvoc-24h','eco2-24h','tvoc-28d','eco2-28d'].forEach(attachTT);
 
-// ── Alert banner ──────────────────────────────────────────────────────────────────────────────\nlet _prevBad=false;
+// ── Alert banner ──────────────────────────────────────────────────────────────────────────────
+let _prevBad=false;
 function updateAlert(tvoc,eco2){
   const tl=lvl(tvoc,TVOC_L),el=lvl(eco2,ECO2_L);
   const b=document.getElementById('alert-banner'), msgs=[];
@@ -692,7 +695,8 @@ function updateAlert(tvoc,eco2){
   } else { b.style.display='none'; }
 }
 
-// ── Phase badge ───────────────────────────────────────────────────────────────────────────────\nconst PHASE={
+// ── Phase badge ───────────────────────────────────────────────────────────────────────────────
+const PHASE={
   starting:['Starting…','ph-starting'],warmup:['Warming up…','ph-warmup'],
   running:['Running','ph-running'],error:['Sensor error','ph-error'],
 };
@@ -714,6 +718,8 @@ async function fetchLive(){
     const b=document.getElementById('badge'); b.textContent=pl; b.className='badge '+pc;
     if(c.ts&&!_gsheetRead)
       document.getElementById('sub').textContent='SGP30 · Updated '+c.ts.slice(11,19);
+    else if(!_gsheetRead)
+      document.getElementById('sub').textContent='SGP30 · '+pl;
     if(c.tvoc!==null){
       const l=lvl(c.tvoc,TVOC_L);
       const v=document.getElementById('tvoc-val'); v.textContent=c.tvoc; v.style.color=l.color;
