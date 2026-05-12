@@ -28,7 +28,8 @@ bash install.sh
 
 `install.sh` will:
 - Enable I²C if not already on
-- Install `python3-pip`, `i2c-tools`, `smbus2`, and `flask`
+- Install `python3-venv` and `i2c-tools` via apt
+- Create a virtualenv at `.venv/` and install `smbus2` and `flask` into it (system Python is untouched)
 - Add your user to the `i2c` group
 - Install and start a **systemd service** (`voc.service`) that runs the web dashboard automatically on boot
 
@@ -65,6 +66,22 @@ sudo systemctl disable voc       # don't start on boot
 ```
 
 ---
+
+## Running scripts manually
+
+All scripts run inside the virtualenv. Either activate it first:
+
+```bash
+source .venv/bin/activate
+python3 read_voc.py
+deactivate
+```
+
+Or call the venv Python directly without activating:
+
+```bash
+.venv/bin/python3 read_voc.py
+```
 
 ## Command-line scripts
 
