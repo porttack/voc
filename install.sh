@@ -36,12 +36,17 @@ if ! groups "$INSTALL_USER" | grep -q i2c; then
 fi
 
 ###############################################################################
-# 2. System packages (python3-venv needed to create the venv)
+# 2. System packages
 ###############################################################################
 echo ""
 echo "Installing system packages…"
 sudo apt-get update -qq
 sudo apt-get install -y python3-venv python3-dev i2c-tools
+
+# Ensure NTP time sync is active so CSV timestamps are trustworthy
+sudo systemctl enable systemd-timesyncd --quiet
+sudo systemctl start  systemd-timesyncd
+echo "Time sync status: $(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo unknown)"
 
 ###############################################################################
 # 3. Create venv and install Python packages into it
