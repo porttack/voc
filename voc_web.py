@@ -553,7 +553,9 @@ function hideTT(){tt.style.display='none';}
 // ── Chart store ───────────────────────────────────────────────────────────────
 const _cs={};
 
-function drawChart(id,data,key,color,gapSec,range,mmId,envMin,envMax){
+// tStart/tEnd: epoch seconds for the full window (not just data range)
+// LEVELS: TVOC_L or ECO2_L — used for per-segment zone coloring
+function drawChart(id,data,key,LEVELS,gapSec,tStart,tEnd,mmId,envMin,envMax){
   const canvas=document.getElementById(id); if(!canvas) return;
   const vals=data.map(d=>d[key]);
   if(mmId&&vals.length){
@@ -571,9 +573,10 @@ function drawChart(id,data,key,color,gapSec,range,mmId,envMin,envMax){
   const envHi=envMax?Math.max(...data.map(d=>d[envMax])):-Infinity;
   const lo=Math.min(Math.min(...vals),envLo),hi=Math.max(Math.max(...vals),envHi);
   const span=(hi-lo)||1;
-  const px=i=>ML+(i/(vals.length-1))*PW;
+  const tRange=tEnd-tStart;
+  const px=t=>ML+((t-tStart)/tRange)*PW;
   const py=v=>MT+PH*(0.94-0.88*(v-lo)/span);
-  _cs[id]={data,key,range,ML,PW,lo,span,MT,PH,envMin,envMax,color};
+  _cs[id]={data,key,LEVELS,tStart,tEnd,ML,PW,lo,span,MT,PH,envMin,envMax};
 
   // Background + axes
   ctx.fillStyle='#f8fafc'; ctx.fillRect(ML,MT,PW,PH);
@@ -589,49 +592,52 @@ function drawChart(id,data,key,color,gapSec,range,mmId,envMin,envMax){
   ctx.textBaseline='bottom'; ctx.fillStyle='#94a3b8';
                               ctx.fillText(Math.round(lo),        ML-4,MT+PH-1);
 
-  // X labels
-  const n=vals.length, step=Math.max(1,Math.floor(n/5));
-  const fmtX=range==='24h'
-    ?t=>{const d=new Date(t*1000);return String(d.getHours()).padStart(2,'0')+':00';}
-    :range==='28d'
-    ?t=>new Date(t*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})
-    :t=>{const d=new Date(t*1000);return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
+  // X labels — 5 evenly spaced ticks across the full time window
+  const isDate=tRange>2*86400;
   ctx.textAlign='center'; ctx.textBaseline='top'; ctx.fillStyle='#94a3b8';
-  for(let i=0;i<n;i+=step){
-    const x=px(i);
+  for(let i=0;i<=4;i++){
+    const t=tStart+(i/4)*tRange, x=ML+(i/4)*PW;
     ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(x,MT+PH); ctx.lineTo(x,MT+PH+4); ctx.stroke();
-    ctx.fillText(fmtX(data[i].t),x,MT+PH+5);
+    const d=new Date(t*1000);
+    const lbl=isDate
+      ?d.toLocaleDateString('en-US',{month:'short',day:'numeric'})
+      :String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+    ctx.fillText(lbl,x,MT+PH+5);
   }
 
-  // Daily envelope
+  // Daily envelope (28d only) — neutral shading
   if(envMin&&envMax){
-    ctx.globalAlpha=0.15; ctx.fillStyle=color; ctx.beginPath();
-    for(let i=0;i<n;i++){const x=px(i),y=py(data[i][envMax]||vals[i]); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
-    for(let i=n-1;i>=0;i--)ctx.lineTo(px(i),py(data[i][envMin]||vals[i]));
+    ctx.globalAlpha=0.15; ctx.fillStyle='#94a3b8'; ctx.beginPath();
+    const n=data.length;
+    for(let i=0;i<n;i++){const x=px(data[i].t),y=py(data[i][envMax]||vals[i]); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);}
+    for(let i=n-1;i>=0;i--)ctx.lineTo(px(data[i].t),py(data[i][envMin]||vals[i]));
     ctx.closePath(); ctx.fill(); ctx.globalAlpha=1;
   }
 
-  // Line with gap detection
-  ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=1.8; ctx.lineJoin='round';
-  for(let i=0;i<n;i++){
-    const gap=i>0&&(data[i].t-data[i-1].t)>gapSec;
-    gap||i===0?ctx.moveTo(px(i),py(vals[i])):ctx.lineTo(px(i),py(vals[i]));
+  // Line — each segment colored by its zone
+  ctx.lineWidth=1.8; ctx.lineJoin='round';
+  for(let i=1;i<data.length;i++){
+    if((data[i].t-data[i-1].t)>gapSec) continue;
+    ctx.beginPath();
+    ctx.strokeStyle=lvl(vals[i],LEVELS).color;
+    ctx.moveTo(px(data[i-1].t),py(vals[i-1]));
+    ctx.lineTo(px(data[i].t),py(vals[i]));
+    ctx.stroke();
   }
-  ctx.stroke();
 
-  // Area fill
-  ctx.globalAlpha=0.10; ctx.fillStyle=color; let open=false; ctx.beginPath();
-  for(let i=0;i<n;i++){
-    const x=px(i),y=py(vals[i]),gap=i>0&&(data[i].t-data[i-1].t)>gapSec;
-    if(gap||i===0){if(open){ctx.lineTo(px(i-1),MT+PH);ctx.closePath();ctx.fill();ctx.beginPath();}ctx.moveTo(x,MT+PH);ctx.lineTo(x,y);open=true;}else ctx.lineTo(x,y);
+  // Area fill — neutral
+  ctx.globalAlpha=0.08; ctx.fillStyle='#64748b'; let open=false; ctx.beginPath();
+  for(let i=0;i<data.length;i++){
+    const x=px(data[i].t),y=py(vals[i]),gap=i>0&&(data[i].t-data[i-1].t)>gapSec;
+    if(gap||i===0){if(open){ctx.lineTo(px(data[i-1].t),MT+PH);ctx.closePath();ctx.fill();ctx.beginPath();}ctx.moveTo(x,MT+PH);ctx.lineTo(x,y);open=true;}else ctx.lineTo(x,y);
   }
-  if(open){ctx.lineTo(px(n-1),MT+PH);ctx.closePath();ctx.fill();}
+  if(open){ctx.lineTo(px(data[data.length-1].t),MT+PH);ctx.closePath();ctx.fill();}
   ctx.globalAlpha=1;
 
-  // Terminal dot
-  ctx.beginPath(); ctx.arc(px(n-1),py(vals[n-1]),3.5,0,Math.PI*2);
-  ctx.fillStyle=color; ctx.fill();
+  // Terminal dot — colored by last point's zone
+  ctx.beginPath(); ctx.arc(px(data[data.length-1].t),py(vals[data.length-1]),3.5,0,Math.PI*2);
+  ctx.fillStyle=lvl(vals[data.length-1],LEVELS).color; ctx.fill();
 }
 
 // ── Tooltip hit-testing ───────────────────────────────────────────────────────
@@ -641,13 +647,18 @@ function chartHover(e,id){
   const cx=e.touches?e.touches[0].clientX:e.clientX;
   const cy=e.touches?e.touches[0].clientY:e.clientY;
   const frac=Math.max(0,Math.min(1,(cx-rect.left-s.ML)/s.PW));
-  const idx=Math.round(frac*(s.data.length-1));
-  const pt=s.data[Math.max(0,Math.min(s.data.length-1,idx))]; if(!pt) return;
-  const val=pt[s.key], unit=s.key==='tvoc'?'ppb':'ppm';
-  const l=lvl(val,s.key==='tvoc'?TVOC_L:ECO2_L);
+  const tHover=s.tStart+frac*(s.tEnd-s.tStart);
+  let best=0,bestDist=Infinity;
+  for(let i=0;i<s.data.length;i++){const d=Math.abs(s.data[i].t-tHover);if(d<bestDist){bestDist=d;best=i;}}
+  const pt=s.data[best]; if(!pt) return;
+  const val=pt[s.key],unit=s.key==='tvoc'?'ppb':'ppm';
+  const l=lvl(val,s.LEVELS);
   const d=new Date(pt.t*1000);
-  const ts=s.range==='28d'?d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})
-    :s.range==='24h'?d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
+  const tRange=s.tEnd-s.tStart;
+  const ts=tRange>2*86400
+    ?d.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})
+    :tRange>400
+    ?d.toLocaleString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
     :d.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
   let html=`<b>${ts}</b><br>${val} ${unit} &mdash; <span style="color:${l.color}">${l.label}</span>`;
   if(s.envMin&&pt[s.envMin]!==undefined)
@@ -719,10 +730,9 @@ async function fetchLive(){
     }
     if(c.tvoc!==null&&c.eco2!==null) updateAlert(c.tvoc,c.eco2);
     if(!_gsheetRead&&h.length>1){
-      const tc=c.tvoc!==null?lvl(c.tvoc,TVOC_L).color:'#64748b';
-      const ec=c.eco2!==null?lvl(c.eco2,ECO2_L).color:'#64748b';
-      drawChart('tvoc-live',h,'tvoc',tc,120,'5m','mm-tvoc-live',null,null);
-      drawChart('eco2-live',h,'eco2',ec,120,'5m','mm-eco2-live',null,null);
+      const now=Date.now()/1000;
+      drawChart('tvoc-live',h,'tvoc',TVOC_L,120,now-300,now,'mm-tvoc-live',null,null);
+      drawChart('eco2-live',h,'eco2',ECO2_L,120,now-300,now,'mm-eco2-live',null,null);
     }
   }catch(_){
     const b=document.getElementById('badge');
@@ -735,13 +745,13 @@ async function fetchHistory(range){
   try{
     const {data}=await(await fetch('/api/history?range='+range)).json();
     if(!data||data.length<2) return;
-    const last=data[data.length-1];
-    const tc=lvl(last.tvoc,TVOC_L).color,ec=lvl(last.eco2,ECO2_L).color;
+    const now=Date.now()/1000;
+    const tStart=range==='28d'?now-28*86400:now-86400;
     const gapSec=range==='28d'?10800:600;
     const[tMin,tMax,eMin,eMax]=range==='28d'
       ?['tvoc_dmin','tvoc_dmax','eco2_dmin','eco2_dmax']:[null,null,null,null];
-    drawChart(`tvoc-${range}`,data,'tvoc',tc,gapSec,range,`mm-tvoc-${range}`,tMin,tMax);
-    drawChart(`eco2-${range}`,data,'eco2',ec,gapSec,range,`mm-eco2-${range}`,eMin,eMax);
+    drawChart(`tvoc-${range}`,data,'tvoc',TVOC_L,gapSec,tStart,now,`mm-tvoc-${range}`,tMin,tMax);
+    drawChart(`eco2-${range}`,data,'eco2',ECO2_L,gapSec,tStart,now,`mm-eco2-${range}`,eMin,eMax);
   }catch(e){console.warn('history',range,e);}
 }
 
