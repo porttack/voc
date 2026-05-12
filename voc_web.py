@@ -94,9 +94,11 @@ def _save_baseline(sensor) -> None:
         eco2b, tvocb = sensor.get_baseline()
         if eco2b == 0 and tvocb == 0:
             return
-        with open(BASELINE_FILE, "w") as f:
+        tmp = BASELINE_FILE + ".tmp"
+        with open(tmp, "w") as f:
             json.dump({"eco2_baseline": eco2b, "tvoc_baseline": tvocb,
                        "saved_at": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+        os.replace(tmp, BASELINE_FILE)  # atomic on POSIX — never a partial file
         print(f"Baseline saved: eCO2={eco2b} TVOC={tvocb}", flush=True)
     except Exception as exc:
         print(f"Baseline save error: {exc}", file=sys.stderr, flush=True)

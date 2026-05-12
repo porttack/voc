@@ -12,6 +12,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -41,8 +42,10 @@ def main():
         "tvoc_baseline": tvoc_base,
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
-    with open(BASELINE_FILE, "w") as f:
+    tmp = BASELINE_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(payload, f, indent=2)
+    os.replace(tmp, BASELINE_FILE)  # atomic on POSIX — never a partial file
 
     print(f"Baseline saved to {BASELINE_FILE}")
     print(f"  eCO2 baseline : {eco2_base}")
