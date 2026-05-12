@@ -4,7 +4,8 @@ set -euo pipefail
 
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 INSTALL_USER="$(whoami)"
-PYTHON="$(which python3)"
+VENV="$INSTALL_DIR/.venv"
+VENV_PYTHON="$VENV/bin/python3"
 
 ###############################################################################
 # 1. Enable I2C
@@ -35,20 +36,27 @@ if ! groups "$INSTALL_USER" | grep -q i2c; then
 fi
 
 ###############################################################################
-# 2. System packages
+# 2. System packages (python3-venv needed to create the venv)
 ###############################################################################
 echo ""
 echo "Installing system packages…"
 sudo apt-get update -qq
-sudo apt-get install -y python3-pip python3-dev i2c-tools
+sudo apt-get install -y python3-venv python3-dev i2c-tools
 
 ###############################################################################
-# 3. Python packages
+# 3. Create venv and install Python packages into it
 ###############################################################################
 echo ""
-echo "Installing Python packages…"
-pip3 install --break-system-packages -r "$INSTALL_DIR/requirements.txt" 2>/dev/null \
-    || pip3 install -r "$INSTALL_DIR/requirements.txt"
+if [ -d "$VENV" ]; then
+    echo "Virtual environment already exists at $VENV — updating packages…"
+else
+    echo "Creating virtual environment at $VENV…"
+    python3 -m venv "$VENV"
+fi
+
+echo "Installing Python packages into venv…"
+"$VENV/bin/pip" install --upgrade pip -q
+"$VENV/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
 ###############################################################################
 # 4. Make scripts executable
@@ -56,7 +64,7 @@ pip3 install --break-system-packages -r "$INSTALL_DIR/requirements.txt" 2>/dev/n
 chmod +x "$INSTALL_DIR"/{read_voc.py,save_baseline.py,load_baseline.py,monitor_voc.py,voc_web.py}
 
 ###############################################################################
-# 5. Install and enable systemd service
+# 5. Install and enable systemd service (uses venv Python)
 ###############################################################################
 SERVICE=/etc/systemd/system/voc.service
 
@@ -71,7 +79,7 @@ After=network.target
 Type=simple
 User=${INSTALL_USER}
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${PYTHON} ${INSTALL_DIR}/voc_web.py
+ExecStart=${VENV_PYTHON} ${INSTALL_DIR}/voc_web.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -97,7 +105,15 @@ sudo systemctl status voc --no-pager -l || true
 echo ""
 echo " Dashboard:  http://$(hostname -I | awk '{print $1}'):8080"
 echo ""
-echo " Useful commands:"
+echo " To run scripts manually, activate the venv first:"
+echo "   source $VENV/bin/activate"
+echo "   python3 read_voc.py"
+echo "   deactivate"
+echo ""
+echo " Or call the venv Python directly:"
+echo "   $VENV_PYTHON read_voc.py"
+echo ""
+echo " Service commands:"
 echo "   sudo systemctl status voc      # check service"
 echo "   sudo systemctl restart voc     # restart"
 echo "   sudo journalctl -u voc -f      # live logs"
