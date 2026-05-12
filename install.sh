@@ -2,16 +2,19 @@
 # install.sh — one-time setup for the SGP30 VOC sensor on Raspberry Pi
 set -euo pipefail
 
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_USER="$(whoami)"
+PYTHON="$(which python3)"
+
 ###############################################################################
-# 1. Enable I2C in /boot/config.txt (or /boot/firmware/config.txt on Bookworm)
+# 1. Enable I2C
 ###############################################################################
 if [ -f /boot/firmware/config.txt ]; then
     BOOT_CONFIG=/boot/firmware/config.txt
 elif [ -f /boot/config.txt ]; then
     BOOT_CONFIG=/boot/config.txt
 else
-    echo "ERROR: Cannot find /boot/config.txt or /boot/firmware/config.txt" >&2
-    exit 1
+    echo "ERROR: Cannot find boot config.txt" >&2; exit 1
 fi
 
 if grep -q "^dtparam=i2c_arm=on" "$BOOT_CONFIG"; then
@@ -21,9 +24,14 @@ else
     echo "dtparam=i2c_arm=on" | sudo tee -a "$BOOT_CONFIG"
 fi
 
-# Make sure the i2c-dev module loads at boot
 if ! grep -q "^i2c-dev" /etc/modules 2>/dev/null; then
     echo "i2c-dev" | sudo tee -a /etc/modules
+fi
+
+# Add current user to i2c group so the service can access /dev/i2c-* without root
+if ! groups "$INSTALL_USER" | grep -q i2c; then
+    sudo usermod -aG i2c "$INSTALL_USER"
+    echo "Added $INSTALL_USER to i2c group (takes effect after next login/reboot)"
 fi
 
 ###############################################################################
@@ -39,13 +47,43 @@ sudo apt-get install -y python3-pip python3-dev i2c-tools
 ###############################################################################
 echo ""
 echo "Installing Python packages…"
-pip3 install --break-system-packages -r requirements.txt 2>/dev/null \
-    || pip3 install -r requirements.txt
+pip3 install --break-system-packages -r "$INSTALL_DIR/requirements.txt" 2>/dev/null \
+    || pip3 install -r "$INSTALL_DIR/requirements.txt"
 
 ###############################################################################
 # 4. Make scripts executable
 ###############################################################################
-chmod +x read_voc.py save_baseline.py load_baseline.py monitor_voc.py
+chmod +x "$INSTALL_DIR"/{read_voc.py,save_baseline.py,load_baseline.py,monitor_voc.py,voc_web.py}
+
+###############################################################################
+# 5. Install and enable systemd service
+###############################################################################
+SERVICE=/etc/systemd/system/voc.service
+
+echo ""
+echo "Installing systemd service…"
+sudo tee "$SERVICE" > /dev/null <<EOF
+[Unit]
+Description=SGP30 VOC Web Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=${INSTALL_USER}
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${PYTHON} ${INSTALL_DIR}/voc_web.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable voc
+sudo systemctl start voc
 
 ###############################################################################
 # Done
@@ -54,15 +92,17 @@ echo ""
 echo "============================================================"
 echo " Installation complete."
 echo ""
-echo " If I2C was just enabled, REBOOT now:"
+echo " Service status:"
+sudo systemctl status voc --no-pager -l || true
+echo ""
+echo " Dashboard:  http://$(hostname -I | awk '{print $1}'):8080"
+echo ""
+echo " Useful commands:"
+echo "   sudo systemctl status voc      # check service"
+echo "   sudo systemctl restart voc     # restart"
+echo "   sudo journalctl -u voc -f      # live logs"
+echo ""
+echo " If I2C was just enabled, or you were just added to the"
+echo " i2c group, reboot for changes to take effect:"
 echo "   sudo reboot"
-echo ""
-echo " After reboot, verify the sensor is detected (should show '58'):"
-echo "   i2cdetect -y 1"
-echo ""
-echo " Quick start:"
-echo "   python3 read_voc.py            # single reading"
-echo "   python3 monitor_voc.py         # continuous monitoring"
-echo "   python3 save_baseline.py       # save baseline (after 12 h)"
-echo "   python3 load_baseline.py       # inspect / reload baseline"
 echo "============================================================"
