@@ -24,104 +24,96 @@ The SGP30 has a fixed I²C address of **0x58** — no address configuration need
 git clone https://github.com/porttack/voc.git
 cd voc
 bash install.sh
-# reboot if I2C was just enabled
-sudo reboot
 ```
 
-After reboot, confirm the sensor is visible:
+`install.sh` will:
+- Enable I²C if not already on
+- Install `python3-pip`, `i2c-tools`, `smbus2`, and `flask`
+- Add your user to the `i2c` group
+- Install and start a **systemd service** (`voc.service`) that runs the web dashboard automatically on boot
+
+After running, open a browser on the same network and go to:
+
+```
+http://<pi-ip-address>:8080
+```
+
+You can find your Pi's IP with `hostname -I`.
+
+> **First run:** the sensor warms up for 15 seconds before showing real readings.
+> Accuracy improves over the first hour; full calibration takes ~12 hours.
+
+---
+
+## Web dashboard
+
+The dashboard auto-updates every 2 seconds and shows:
+
+- **TVOC** and **eCO₂** readings with color-coded air quality ratings
+- Sparkline charts of the last 5 minutes
+- Plain-English explanations of what the numbers mean and why they matter
+- Threshold reference tables
+
+### Service management
 
 ```bash
-i2cdetect -y 1
-# You should see '58' in the grid
+sudo systemctl status voc        # is it running?
+sudo systemctl restart voc       # restart after a code change
+sudo journalctl -u voc -f        # live logs
+sudo systemctl stop voc          # stop the service
+sudo systemctl disable voc       # don't start on boot
 ```
 
 ---
 
-## Scripts
+## Command-line scripts
+
+These are useful for one-off readings or cron jobs and work independently
+of the web service.
 
 ### `read_voc.py` — take a reading
 
 ```bash
-# Single reading (15 s warm-up, then one line of output)
-python3 read_voc.py
-
-# 10 readings, 1 second apart
-python3 read_voc.py --count 10
-
-# Run until Ctrl-C
-python3 read_voc.py --count 0
-
-# Skip loading a saved baseline
+python3 read_voc.py              # single reading (15 s warm-up)
+python3 read_voc.py --count 10   # 10 readings, 1 s apart
+python3 read_voc.py --count 0    # run until Ctrl-C
 python3 read_voc.py --no-baseline
 ```
 
-### `monitor_voc.py` — continuous monitoring
-
-Runs indefinitely at 1 Hz. Automatically loads `baseline.json` at startup
-(if it exists and is less than 7 days old) and saves the baseline every hour.
+### `monitor_voc.py` — continuous terminal monitoring
 
 ```bash
-# Print to stdout
-python3 monitor_voc.py
-
-# Also write a CSV log
-python3 monitor_voc.py --log voc_log.csv
-
-# Ignore any saved baseline
-python3 monitor_voc.py --no-baseline
+python3 monitor_voc.py                     # stdout
+python3 monitor_voc.py --log voc_log.csv   # also log to CSV
 ```
 
-### `save_baseline.py` — persist calibration
-
-Reads the current baseline from the sensor and writes it to `baseline.json`.
-Only run this after the sensor has been **continuously powered for at least 12 hours**;
-before that the baseline values are not yet meaningful.
+### `save_baseline.py` / `load_baseline.py`
 
 ```bash
-python3 save_baseline.py
-```
-
-### `load_baseline.py` — inspect / restore baseline
-
-Shows the contents of `baseline.json` and applies it to the sensor.
-If the file is older than 7 days the baseline is not applied (the sensor
-re-calibrates from scratch instead).
-
-```bash
-python3 load_baseline.py
+python3 save_baseline.py    # persist calibration to baseline.json
+python3 load_baseline.py    # inspect baseline.json and apply to sensor
 ```
 
 ---
 
 ## How the SGP30 baseline works
 
-The SGP30 uses an internal algorithm that adapts to the background air
-quality over time.  Understanding the calibration cycle helps you get
-accurate readings:
+1. **First power-on:** The first 15 s return placeholder values (eCO₂ = 400 ppm,
+   TVOC = 0 ppb). After that readings begin, but accuracy improves over ~12 hours.
 
-1. **First power-on (no baseline):** The first 15 seconds return fixed
-   placeholder values (eCO₂ = 400 ppm, TVOC = 0 ppb).  After that the
-   sensor starts real estimates, but accuracy improves slowly over ~12 hours.
+2. **After 12 hours:** Run `save_baseline.py` (or let the web service do it
+   automatically every hour). The saved baseline is restored on the next startup,
+   giving accurate readings immediately.
 
-2. **After 12 hours of continuous operation:** The baseline is stable.
-   Run `save_baseline.py` to persist it.  The monitor script does this
-   automatically every hour.
+3. **Baseline expiry:** A baseline saved more than 7 days ago is discarded; the
+   sensor recalibrates from scratch.
 
-3. **On next startup:** `read_voc.py` and `monitor_voc.py` load
-   `baseline.json` automatically, giving you accurate readings right away
-   instead of waiting another 12 hours.
-
-4. **Baseline expiry:** If the Pi has been off for more than 7 days the
-   saved baseline is discarded and the sensor recalibrates from scratch.
-   A saved baseline that is ≤ 7 days old is always safe to use.
-
-5. **Calling cadence:** `measure_iaq()` must be called **every 1 second**.
-   The sensor's internal algorithm depends on this fixed rate.  All scripts
-   honour this requirement.
+4. **Calling cadence:** `measure_iaq()` must be called **every 1 second** — the
+   sensor's internal algorithm depends on this fixed rate. All scripts honour it.
 
 ---
 
-## Cron example — save baseline hourly
+## Cron example — save baseline hourly (if not using the web service)
 
 ```cron
 0 * * * * cd /home/pi/voc && python3 save_baseline.py >> /var/log/sgp30_baseline.log 2>&1
@@ -134,10 +126,11 @@ accurate readings:
 | File              | Purpose |
 |-------------------|---------|
 | `sgp30.py`        | Low-level SGP30 driver (smbus2, raw I²C) |
-| `read_voc.py`     | Single or repeated VOC readings |
-| `monitor_voc.py`  | Continuous 1 Hz monitoring with auto-baseline |
+| `voc_web.py`      | Flask web dashboard — runs as a systemd service |
+| `read_voc.py`     | Single or repeated VOC readings (CLI) |
+| `monitor_voc.py`  | Continuous 1 Hz terminal monitoring with auto-baseline |
 | `save_baseline.py`| Save current sensor baseline to `baseline.json` |
 | `load_baseline.py`| Load `baseline.json` and apply to sensor |
 | `baseline.json`   | Saved calibration (auto-created, not in git) |
-| `install.sh`      | One-time setup: I²C enable + pip install |
-| `requirements.txt`| Python dependencies (`smbus2`) |
+| `install.sh`      | One-time setup: I²C, packages, systemd service |
+| `requirements.txt`| Python dependencies (`smbus2`, `flask`) |
