@@ -59,9 +59,12 @@ echo "Installing Python packages into venv…"
 "$VENV/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
 ###############################################################################
-# 4. Make scripts executable
+# 4. Point script shebangs at the venv Python and make them executable
 ###############################################################################
-chmod +x "$INSTALL_DIR"/{read_voc.py,save_baseline.py,load_baseline.py,monitor_voc.py,voc_web.py}
+for script in read_voc.py save_baseline.py load_baseline.py monitor_voc.py voc_web.py; do
+    sed -i "1s|.*|#!${VENV_PYTHON}|" "$INSTALL_DIR/$script"
+    chmod +x "$INSTALL_DIR/$script"
+done
 
 ###############################################################################
 # 5. Install and enable systemd service (uses venv Python)
